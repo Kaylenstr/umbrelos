@@ -1,22 +1,28 @@
-import {useLocation, useNavigate} from 'react-router-dom'
+// In sidebar-recent.tsx (of vergelijkbaar bestand)
+import { useEffect, useState } from 'react';
+import axios from 'axios';
 
-import {SidebarItem} from '@/features/files/components/sidebar/sidebar-item'
-import {BASE_ROUTE_PATH, RECENTS_PATH} from '@/features/files/constants'
-import {t} from '@/utils/i18n'
+export function SidebarRecent() {
+  const [recentItems, setRecentItems] = useState([]);
 
-export function SidebarRecents() {
-	const navigate = useNavigate()
-	const {pathname} = useLocation()
+  useEffect(() => {
+    // Haal recente items op (normaal gesproken)
+    axios.get('/api/files/recent').then(res => setRecentItems(res.data));
 
-	return (
-		<SidebarItem
-			item={{
-				name: t('files-sidebar.recents'),
-				path: RECENTS_PATH,
-				type: 'directory',
-			}}
-			isActive={pathname === `${BASE_ROUTE_PATH}${RECENTS_PATH}`}
-			onClick={() => navigate(`${BASE_ROUTE_PATH}${RECENTS_PATH}`)}
-		/>
-	)
+    // Haal ook SMB-shares op (tijdelijk voor testen)
+    axios.get('/api/files/smb/shares').then(res => {
+      setRecentItems(prev => [...prev, ...res.data]);
+    });
+  }, []);
+
+  return (
+    <div>
+      <h4>Recente items</h4>
+      {recentItems.map(item => (
+        <div key={item.path} className="sidebar-item">
+          <span>{item.name}</span>
+        </div>
+      ))}
+    </div>
+  );
 }

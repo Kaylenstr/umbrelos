@@ -22,6 +22,17 @@ import Dbus from './modules/dbus/dbus.js'
 import {detectDevice, setCpuGovernor, connectToWiFiNetwork} from './modules/system.js'
 import {commitOsPartition} from './modules/system.js'
 import {overrideDevelopmentHostname} from './modules/development.js'
+import { mountExternalShare } from './smb';
+
+router.post('/smb/mount', async (req, res) => {
+  const { remotePath, mountPath, username, password } = req.body;
+  try {
+    await mountExternalShare(remotePath, mountPath, username, password);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 type StoreSchema = {
 	version: string

@@ -61,3 +61,26 @@ export function SidebarShares({shares}: {shares: (Share | null)[]}) {
 		</AnimatePresence>
 	)
 }
+
+// In sidebar-shares.tsx
+import { useEffect, useState } from 'react';
+import axios from 'axios';
+
+export function SidebarShares() {
+  const [shares, setShares] = useState([]);
+
+  useEffect(() => {
+    axios.get('/api/files/smb/shares').then(res => setShares(res.data));
+  }, []);
+
+  return (
+    <div>
+      <h4>Netwerkshares</h4>
+      {shares.map(share => (
+        <div key={share.path} className="sidebar-item">
+          <span>{share.name}</span>
+        </div>
+      ))}
+    </div>
+  );
+}

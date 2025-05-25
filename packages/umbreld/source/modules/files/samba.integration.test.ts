@@ -1,3 +1,203 @@
+client.files.shares.query()
+		const paths = shares.map((share) => share.path)
+		expect(paths).not.toContain('/Home/samba-remove-test')
+	})
+
+	test('returns false when removing non-existent share', async () => {
+		const result = await umbreld.client.files.removeShare.mutate({path: '/Home/non-existent-share'})
+
+		expect(result).toBe(false)
+	})
+})
+
+describe('sharePassword()', () => {
+	test('throws invalid error without auth token', async () => {
+		await expect(umbreld.unauthenticatedClient.files.sharePassword.query()).rejects.toThrow('Invalid token')
+	})
+
+	test('generates a 128-bit hex string on first run', async () => {
+		const sharePassword = await umbreld.client.files.sharePassword.query()
+
+		// Check it's a 128-bit hex string (32 hex characters = 128 bits)
+		expect(sharePassword.length).toBe(32)
+		expect(/^[0-9a-f]{32}$/.test(sharePassword)).toBe(true)
+	})
+
+	test('always returns the same password', async () => {
+		const sharePassword1 = await umbreld.client.files.sharePassword.query()
+		const sharePassword2 = await umbreld.client.files.sharePassword.query()
+
+		// Verify it's consistently the same password
+		expect(sharePassword1).toBe(sharePassword2)
+	})
+})
+
+describe('samba', () => {
+	async function createSmbClient(share: string) {
+		const password = await umbreld.client.files.sharePassword.query()
+		return new (SMB2 as any)({
+			share: `\\\\localhost\\${share}`,
+			username: 'umbrel',
+			password,
+		})
+	}
+
+	test('port is only listening where shares are active', async () => {
+		const smbPort = 445
+
+		// Check if port is open
+		await expect(tcpPortUsed.check(smbPort, 'localhost')).resolves.toBe(false)
+
+		// Add home directory to shares
+		await expect(umbreld.client.files.addShare.mutate({path: '/Home'})).resolves.toBe('/Home')
+
+		// Check if port is open
+		await expect(tcpPortUsed.check(smbPort, 'localhost')).resolves.toBe(true)
+
+		// Remove share
+		await expect(umbreld.client.files.removeShare.mutate({path: '/Home'})).resolves.toBe(true)
+
+		// Check if port is closed again
+		await expect(tcpPortUsed.check(smbPort, 'localhost')).resolves.toBe(false)
+	})
+
+	test('share name has (Umbrel appended)', async () => {
+		// Add home directory to shares
+		await expect(umbreld.client.files.addShare.mutate({path: '/Home/Documents'})).resolves.toBe('/Home/Documents')
+
+		// create an SMB2 instance
+		const smb = await createSmbClient('Documents (Umbrel)')
+
+		// Test connection
+		await expect(smb.exists('non-existent-file.txt')).resolves.toBe(false)
+	})
+
+	test('/Home share is called "username\'s Umbrel"', async () => {
+		// Add home directory to shares
+		await expect(umbreld.client.files.addShare.mutate({path: '/Home'})).resolves.toBe('/Home')
+
+		// create an SMB2 instance
+		const smb = await createSmbClient("satoshi's Umbrel")
+
+		// Test connection
+		await expect(smb.exists('non-existent-file.txt')).resolves.toBe(false)
+	})
+
+	test('client can interact with share', async () => {
+		// Add home directory to shares
+		await expect(umbreld.client.files.addShare.mutate({path: '/Home'})).resolves.toBe('/Home')
+
+		// create an SMB2 instance
+		const smb = await createSmbClient("satoshi's Umbrel")
+
+		// Test connection
+		await expect(smb.exists('non-existent-file.txt')).resolves.toBe(false)
+
+		// Test write
+		await expect(smb.writeFile('file.txt', 'hello world', {encoding: 'utf8'})).resolves.toBe(undefined)
+
+		// Test file exists on filesystem
+		await expect(fse.exists(`${umbreld.instance.dataDirectory}/home/file.txt`)).resolves.toBe(true)
+
+		// Test read
+		await expect(smb.readFile('file.txt', {encoding: 'utf8'})).resolves.toBe('hello world')
+
+		// Remove the share
+		await expect(umbreld.client.files.removeShare.mutate({path: '/Home'})).resolves.toBe(true)
+
+		// Test read no longer works
+		// For some reason the first read after close hangs and the second throws so we do a dummy read
+		// first that hangs
+		smb.readFile('file.txt', {encoding: 'utf8'})
+		// And then a second read that throws
+		await expect(smb.readFile('file.txt', {encoding: 'utf8'})).rejects.toThrow('write EPIPE')
+	})
+
+	test('reloads config when shares are updated', async () => {
+		const smbHome = await createSmbClient("satoshi's Umbrel")
+		let smbDocuments = await createSmbClient('Documents (Umbrel)')
+
+		// Add home directory to shares and test it works
+		await umbreld.client.files.addShare.mutate({path: '/Home'})
+		await expect(smbHome.exists('non-existent-file.txt')).resolves.toBe(false)
+		await expect(smbDocuments.exists('non-existent-file.txt')).rejects.toThrow('STATUS_BAD_NETWORK_NAME')
+
+		// Add documents share and test it works
+		// We need to recreate the client because for some reason it can't be used after the above error
+		smbDocuments = await createSmbClient('Documents (Umbrel)')
+		await umbreld.client.files.addShare.mutate({path: '/Home/Documents'})
+		await expect(smbHome.exists('non-existent-file.txt')).resolves.toBe(false)
+		await expect(smbDocuments.exists('non-existent-file.txt')).resolves.toBe(false)
+	})
+
+	test("doesn't allow escaping shared directories via path traversal", async () => {
+		// Create test directory file
+		const testFile = `${umbreld.instance.dataDirectory}/home/path-traversal-test/test/file.txt`
+		await fse.ensureFile(testFile)
+
+		// Create a sensitive file outside the share
+		const sensitiveFile = `${umbreld.instance.dataDirectory}/secrets/sensitive.txt`
+		await fse.ensureFile(sensitiveFile)
+
+		// Add test directory to shares
+		await umbreld.client.files.addShare.mutate({path: '/Home/path-traversal-test'})
+
+		// Connect to share
+		const smb = await createSmbClient('path-traversal-test (Umbrel)')
+
+		// Test ..\\ syntax works
+		await expect(smb.readFile('test\\..\\test\\file.txt', {encoding: 'utf8'})).resolves.toBe('')
+
+		// Test traversal outside of share fails
+		await expect(smb.readFile('..\\..\\secrets\\sensitive.txt', {encoding: 'utf8'})).rejects.toThrow(
+			'STATUS_OBJECT_PATH_SYNTAX_BAD',
+		)
+	})
+
+	test("doesn't allow escaping shared directories via symlinks", async () => {
+		// Create a sensitive file outside of files root
+		const sensitiveFile = `${umbreld.instance.dataDirectory}/secrets/sensitive.txt`
+		await fse.ensureFile(sensitiveFile)
+		await fse.writeFile(sensitiveFile, 'sensitive data')
+
+		// Create test directory with symlink to sensitive file and a normal file
+		const testDirectory = `${umbreld.instance.dataDirectory}/home/symlink-traversal-test`
+		await fse.ensureDir(testDirectory)
+		await fse.symlink(sensitiveFile, `${testDirectory}/symlink-to-sensitive`)
+		await fse.ensureFile(`${testDirectory}/normal-file`)
+
+		// Add test directory to shares
+		await umbreld.client.files.addShare.mutate({path: '/Home/symlink-traversal-test'})
+
+		// Connect to share
+		const smb = await createSmbClient('symlink-traversal-test (Umbrel)')
+
+		// Test samba lists the normal file but not the symlink
+		await expect(smb.readFile('normal-file', {encoding: 'utf8'})).resolves.toBe('')
+		await expect(smb.readFile('symlink-to-sensitive', {encoding: 'utf8'})).rejects.toThrow(
+			'STATUS_OBJECT_NAME_NOT_FOUND',
+		)
+	})
+})
+
+describe('wsdd2', () => {
+	test('runs only while samba runs', async () => {
+		// Check wsdd2 is not running
+		await expect($`systemctl is-active wsdd2`).rejects.toThrow('inactive')
+
+		// Add home directory to shares
+		await expect(umbreld.client.files.addShare.mutate({path: '/Home'})).resolves.toBe('/Home')
+
+		// Check wsdd2 is running
+		await expect($`systemctl is-active wsdd2`).resolves.toMatchObject({stdout: 'active'})
+
+		// Remove share
+		await expect(umbreld.client.files.removeShare.mutate({path: '/Home'})).resolves.toBe(true)
+
+		// Check wsdd2 is not running
+		await expect($`systemctl is-active wsdd2`).rejects.toThrow('inactive')
+	})
+})
 import {expect, beforeEach, afterEach, describe, test} from 'vitest'
 
 import fse from 'fs-extra'
@@ -308,203 +508,4 @@ describe('removeShare()', () => {
 		expect(result).toBe(true)
 
 		// Verify directory is not in shares
-		const shares = await umbreld.client.files.shares.query()
-		const paths = shares.map((share) => share.path)
-		expect(paths).not.toContain('/Home/samba-remove-test')
-	})
-
-	test('returns false when removing non-existent share', async () => {
-		const result = await umbreld.client.files.removeShare.mutate({path: '/Home/non-existent-share'})
-
-		expect(result).toBe(false)
-	})
-})
-
-describe('sharePassword()', () => {
-	test('throws invalid error without auth token', async () => {
-		await expect(umbreld.unauthenticatedClient.files.sharePassword.query()).rejects.toThrow('Invalid token')
-	})
-
-	test('generates a 128-bit hex string on first run', async () => {
-		const sharePassword = await umbreld.client.files.sharePassword.query()
-
-		// Check it's a 128-bit hex string (32 hex characters = 128 bits)
-		expect(sharePassword.length).toBe(32)
-		expect(/^[0-9a-f]{32}$/.test(sharePassword)).toBe(true)
-	})
-
-	test('always returns the same password', async () => {
-		const sharePassword1 = await umbreld.client.files.sharePassword.query()
-		const sharePassword2 = await umbreld.client.files.sharePassword.query()
-
-		// Verify it's consistently the same password
-		expect(sharePassword1).toBe(sharePassword2)
-	})
-})
-
-describe('samba', () => {
-	async function createSmbClient(share: string) {
-		const password = await umbreld.client.files.sharePassword.query()
-		return new (SMB2 as any)({
-			share: `\\\\localhost\\${share}`,
-			username: 'umbrel',
-			password,
-		})
-	}
-
-	test('port is only listening where shares are active', async () => {
-		const smbPort = 445
-
-		// Check if port is open
-		await expect(tcpPortUsed.check(smbPort, 'localhost')).resolves.toBe(false)
-
-		// Add home directory to shares
-		await expect(umbreld.client.files.addShare.mutate({path: '/Home'})).resolves.toBe('/Home')
-
-		// Check if port is open
-		await expect(tcpPortUsed.check(smbPort, 'localhost')).resolves.toBe(true)
-
-		// Remove share
-		await expect(umbreld.client.files.removeShare.mutate({path: '/Home'})).resolves.toBe(true)
-
-		// Check if port is closed again
-		await expect(tcpPortUsed.check(smbPort, 'localhost')).resolves.toBe(false)
-	})
-
-	test('share name has (Umbrel appended)', async () => {
-		// Add home directory to shares
-		await expect(umbreld.client.files.addShare.mutate({path: '/Home/Documents'})).resolves.toBe('/Home/Documents')
-
-		// create an SMB2 instance
-		const smb = await createSmbClient('Documents (Umbrel)')
-
-		// Test connection
-		await expect(smb.exists('non-existent-file.txt')).resolves.toBe(false)
-	})
-
-	test('/Home share is called "username\'s Umbrel"', async () => {
-		// Add home directory to shares
-		await expect(umbreld.client.files.addShare.mutate({path: '/Home'})).resolves.toBe('/Home')
-
-		// create an SMB2 instance
-		const smb = await createSmbClient("satoshi's Umbrel")
-
-		// Test connection
-		await expect(smb.exists('non-existent-file.txt')).resolves.toBe(false)
-	})
-
-	test('client can interact with share', async () => {
-		// Add home directory to shares
-		await expect(umbreld.client.files.addShare.mutate({path: '/Home'})).resolves.toBe('/Home')
-
-		// create an SMB2 instance
-		const smb = await createSmbClient("satoshi's Umbrel")
-
-		// Test connection
-		await expect(smb.exists('non-existent-file.txt')).resolves.toBe(false)
-
-		// Test write
-		await expect(smb.writeFile('file.txt', 'hello world', {encoding: 'utf8'})).resolves.toBe(undefined)
-
-		// Test file exists on filesystem
-		await expect(fse.exists(`${umbreld.instance.dataDirectory}/home/file.txt`)).resolves.toBe(true)
-
-		// Test read
-		await expect(smb.readFile('file.txt', {encoding: 'utf8'})).resolves.toBe('hello world')
-
-		// Remove the share
-		await expect(umbreld.client.files.removeShare.mutate({path: '/Home'})).resolves.toBe(true)
-
-		// Test read no longer works
-		// For some reason the first read after close hangs and the second throws so we do a dummy read
-		// first that hangs
-		smb.readFile('file.txt', {encoding: 'utf8'})
-		// And then a second read that throws
-		await expect(smb.readFile('file.txt', {encoding: 'utf8'})).rejects.toThrow('write EPIPE')
-	})
-
-	test('reloads config when shares are updated', async () => {
-		const smbHome = await createSmbClient("satoshi's Umbrel")
-		let smbDocuments = await createSmbClient('Documents (Umbrel)')
-
-		// Add home directory to shares and test it works
-		await umbreld.client.files.addShare.mutate({path: '/Home'})
-		await expect(smbHome.exists('non-existent-file.txt')).resolves.toBe(false)
-		await expect(smbDocuments.exists('non-existent-file.txt')).rejects.toThrow('STATUS_BAD_NETWORK_NAME')
-
-		// Add documents share and test it works
-		// We need to recreate the client because for some reason it can't be used after the above error
-		smbDocuments = await createSmbClient('Documents (Umbrel)')
-		await umbreld.client.files.addShare.mutate({path: '/Home/Documents'})
-		await expect(smbHome.exists('non-existent-file.txt')).resolves.toBe(false)
-		await expect(smbDocuments.exists('non-existent-file.txt')).resolves.toBe(false)
-	})
-
-	test("doesn't allow escaping shared directories via path traversal", async () => {
-		// Create test directory file
-		const testFile = `${umbreld.instance.dataDirectory}/home/path-traversal-test/test/file.txt`
-		await fse.ensureFile(testFile)
-
-		// Create a sensitive file outside the share
-		const sensitiveFile = `${umbreld.instance.dataDirectory}/secrets/sensitive.txt`
-		await fse.ensureFile(sensitiveFile)
-
-		// Add test directory to shares
-		await umbreld.client.files.addShare.mutate({path: '/Home/path-traversal-test'})
-
-		// Connect to share
-		const smb = await createSmbClient('path-traversal-test (Umbrel)')
-
-		// Test ..\\ syntax works
-		await expect(smb.readFile('test\\..\\test\\file.txt', {encoding: 'utf8'})).resolves.toBe('')
-
-		// Test traversal outside of share fails
-		await expect(smb.readFile('..\\..\\secrets\\sensitive.txt', {encoding: 'utf8'})).rejects.toThrow(
-			'STATUS_OBJECT_PATH_SYNTAX_BAD',
-		)
-	})
-
-	test("doesn't allow escaping shared directories via symlinks", async () => {
-		// Create a sensitive file outside of files root
-		const sensitiveFile = `${umbreld.instance.dataDirectory}/secrets/sensitive.txt`
-		await fse.ensureFile(sensitiveFile)
-		await fse.writeFile(sensitiveFile, 'sensitive data')
-
-		// Create test directory with symlink to sensitive file and a normal file
-		const testDirectory = `${umbreld.instance.dataDirectory}/home/symlink-traversal-test`
-		await fse.ensureDir(testDirectory)
-		await fse.symlink(sensitiveFile, `${testDirectory}/symlink-to-sensitive`)
-		await fse.ensureFile(`${testDirectory}/normal-file`)
-
-		// Add test directory to shares
-		await umbreld.client.files.addShare.mutate({path: '/Home/symlink-traversal-test'})
-
-		// Connect to share
-		const smb = await createSmbClient('symlink-traversal-test (Umbrel)')
-
-		// Test samba lists the normal file but not the symlink
-		await expect(smb.readFile('normal-file', {encoding: 'utf8'})).resolves.toBe('')
-		await expect(smb.readFile('symlink-to-sensitive', {encoding: 'utf8'})).rejects.toThrow(
-			'STATUS_OBJECT_NAME_NOT_FOUND',
-		)
-	})
-})
-
-describe('wsdd2', () => {
-	test('runs only while samba runs', async () => {
-		// Check wsdd2 is not running
-		await expect($`systemctl is-active wsdd2`).rejects.toThrow('inactive')
-
-		// Add home directory to shares
-		await expect(umbreld.client.files.addShare.mutate({path: '/Home'})).resolves.toBe('/Home')
-
-		// Check wsdd2 is running
-		await expect($`systemctl is-active wsdd2`).resolves.toMatchObject({stdout: 'active'})
-
-		// Remove share
-		await expect(umbreld.client.files.removeShare.mutate({path: '/Home'})).resolves.toBe(true)
-
-		// Check wsdd2 is not running
-		await expect($`systemctl is-active wsdd2`).rejects.toThrow('inactive')
-	})
-})
+		const shares = await umbreld.
